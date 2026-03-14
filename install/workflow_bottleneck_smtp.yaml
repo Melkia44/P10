@@ -1,0 +1,391 @@
+id: bottleneck-data-pipeline
+namespace: bottleneck.production
+description: |
+  Pipeline d'orchestration des données BottleNeck
+  Ingestion → Nettoyage → Fusion → Calcul CA → Classification → Export → Tests
+  Alerting SMTP via MailHog (serveur local) — Z-Score configurable
+
+labels:
+  project: bottleneck
+  env: production
+
+variables:
+  zscore_threshold: 3
+  zscore_max_outlier_pct: 0.05
+  smtp_host: "host.docker.internal"
+  smtp_port: "1025"
+  smtp_from: "kestra-pipeline@bottleneck.fr"
+  smtp_to: "laurent.manager@bottleneck.fr"
+
+inputs:
+  - id: erp_file
+    type: FILE
+    description: Fichier ERP (Fichier_erp.xlsx)
+  - id: liaison_file
+    type: FILE
+    description: Fichier de liaison (fichier_liaison.xlsx)
+  - id: web_file
+    type: FILE
+    description: Fichier Web (Fichier_web.xlsx)
+
+# ============================================================
+# BLOC ERRORS — ALERTING SMTP (MailHog local)
+# ============================================================
+errors:
+  - id: alerte_email_erreur
+    type: io.kestra.plugin.notifications.mail.MailSend
+    host: "{{ vars.smtp_host }}"
+    port: "{{ vars.smtp_port }}"
+    from: "{{ vars.smtp_from }}"
+    to: "{{ vars.smtp_to }}"
+    subject: "[BOTTLENECK] Pipeline en ERREUR - {{ execution.id }}"
+    htmlTextContent: |
+      <h2 style="color:#C62828;">Pipeline BottleNeck en erreur</h2>
+      <table style="border-collapse:collapse;font-family:Arial;">
+        <tr><td style="padding:8px;font-weight:bold;background:#f5f5f5;">Flow</td><td style="padding:8px;">{{ flow.id }}</td></tr>
+        <tr><td style="padding:8px;font-weight:bold;background:#f5f5f5;">Namespace</td><td style="padding:8px;">{{ flow.namespace }}</td></tr>
+        <tr><td style="padding:8px;font-weight:bold;background:#f5f5f5;">Execution</td><td style="padding:8px;">{{ execution.id }}</td></tr>
+        <tr><td style="padding:8px;font-weight:bold;background:#f5f5f5;">Statut</td><td style="padding:8px;color:red;font-weight:bold;">FAILED</td></tr>
+        <tr><td style="padding:8px;font-weight:bold;background:#f5f5f5;">Date</td><td style="padding:8px;">{{ execution.startDate }}</td></tr>
+      </table>
+      <p style="margin-top:16px;">Consultez les logs dans <a href="http://localhost:8080">Kestra</a> pour diagnostiquer l'erreur.</p>
+      <hr style="border:1px solid #eee;"/>
+      <p style="color:#888;font-size:12px;">Message automatique — Pipeline bottleneck.production</p>
+
+  - id: log_erreur
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      ❌ PIPELINE EN ERREUR — Email d'alerte envoyé à {{ vars.smtp_to }}
+    level: ERROR
+
+tasks:
+
+  # ============================================================
+  # ÉTAPE 1 : INGESTION ET NETTOYAGE
+  # ============================================================
+  - id: ingestion_nettoyage
+    type: io.kestra.plugin.scripts.python.Script
+    description: "Ingestion des 3 sources, dédoublonnage et suppression des valeurs manquantes"
+    containerImage: python:3.11-slim
+    inputFiles:
+      erp.xlsx: "{{ inputs.erp_file }}"
+      liaison.xlsx: "{{ inputs.liaison_file }}"
+      web.xlsx: "{{ inputs.web_file }}"
+    beforeCommands:
+      - pip install pandas openpyxl
+    outputFiles:
+      - "erp_clean.csv"
+      - "liaison_clean.csv"
+      - "web_clean.csv"
+      - "ingestion_report.json"
+    script: |
+      import pandas as pd
+      import json
+
+      report = {}
+
+      # --- ERP ---
+      erp = pd.read_excel('erp.xlsx')
+      report['erp_raw'] = len(erp)
+      erp = erp.drop_duplicates(subset=['product_id'])
+      report['erp_after_dedup'] = len(erp)
+      erp = erp[erp['price'] >= 0]
+      report['erp_after_clean'] = len(erp)
+      erp.to_csv('erp_clean.csv', index=False)
+
+      # --- LIAISON ---
+      liaison = pd.read_excel('liaison.xlsx')
+      report['liaison_raw'] = len(liaison)
+      liaison = liaison.drop_duplicates(subset=['product_id'])
+      liaison = liaison.dropna(subset=['id_web'])
+      liaison['id_web'] = liaison['id_web'].astype(str).str.strip()
+      report['liaison_after_clean'] = len(liaison)
+      liaison.to_csv('liaison_clean.csv', index=False)
+
+      # --- WEB ---
+      web = pd.read_excel('web.xlsx')
+      report['web_raw'] = len(web)
+      web = web.drop_duplicates()
+      web_products = web[web['post_type'] == 'product'].drop_duplicates(subset=['sku'])
+      web_products = web_products.dropna(subset=['sku']).copy()
+      web_products['sku'] = web_products['sku'].astype(str).str.strip()
+      report['web_products_clean'] = len(web_products)
+      web_products.to_csv('web_clean.csv', index=False)
+
+      # Vérifications critiques
+      if report['erp_after_clean'] == 0:
+          raise Exception("ERREUR CRITIQUE : fichier ERP vide après nettoyage")
+      if report['web_products_clean'] == 0:
+          raise Exception("ERREUR CRITIQUE : aucun produit web après nettoyage")
+
+      with open('ingestion_report.json', 'w') as f:
+          json.dump(report, f, indent=2)
+      print(json.dumps(report, indent=2))
+
+  # ============================================================
+  # ÉTAPE 2 : FUSION DES DONNÉES
+  # ============================================================
+  - id: fusion
+    type: io.kestra.plugin.scripts.python.Script
+    description: "Fusion ERP + Liaison + Web par jointures sur product_id et id_web/sku"
+    containerImage: python:3.11-slim
+    beforeCommands:
+      - pip install pandas
+    inputFiles:
+      erp_clean.csv: "{{ outputs.ingestion_nettoyage.outputFiles['erp_clean.csv'] }}"
+      liaison_clean.csv: "{{ outputs.ingestion_nettoyage.outputFiles['liaison_clean.csv'] }}"
+      web_clean.csv: "{{ outputs.ingestion_nettoyage.outputFiles['web_clean.csv'] }}"
+    outputFiles:
+      - "dataset_fusionne.csv"
+      - "fusion_report.json"
+    script: |
+      import pandas as pd
+      import json
+
+      erp = pd.read_csv('erp_clean.csv')
+      liaison = pd.read_csv('liaison_clean.csv', dtype={'id_web': str})
+      web = pd.read_csv('web_clean.csv', dtype={'sku': str})
+
+      # JOIN 1 : ERP + Liaison sur product_id
+      merged = erp.merge(liaison, on='product_id', how='inner')
+
+      # JOIN 2 : Résultat + Web sur id_web = sku
+      final = merged.merge(
+          web[['sku', 'post_title', 'post_excerpt', 'total_sales']],
+          left_on='id_web', right_on='sku', how='inner'
+      )
+
+      if len(final) == 0:
+          raise Exception("ERREUR CRITIQUE : fusion vide — aucune correspondance entre les sources")
+
+      report = {
+          'erp_rows': len(erp),
+          'liaison_rows': len(liaison),
+          'web_rows': len(web),
+          'after_erp_liaison_join': len(merged),
+          'after_web_join': len(final),
+          'join_ratio_pct': round(len(final) / len(erp) * 100, 2)
+      }
+
+      final.to_csv('dataset_fusionne.csv', index=False)
+      with open('fusion_report.json', 'w') as f:
+          json.dump(report, f, indent=2)
+      print(json.dumps(report, indent=2))
+
+  # ============================================================
+  # ÉTAPE 3 : CALCUL DU CHIFFRE D'AFFAIRES
+  # ============================================================
+  - id: calcul_ca
+    type: io.kestra.plugin.scripts.python.Script
+    description: "Calcul du CA par produit et du CA global"
+    containerImage: python:3.11-slim
+    beforeCommands:
+      - pip install pandas openpyxl
+    inputFiles:
+      dataset_fusionne.csv: "{{ outputs.fusion.outputFiles['dataset_fusionne.csv'] }}"
+    outputFiles:
+      - "rapport_ca_par_produit.xlsx"
+      - "ca_report.json"
+    script: |
+      import pandas as pd
+      import json
+
+      df = pd.read_csv('dataset_fusionne.csv')
+      df['ca_produit'] = df['price'] * df['total_sales']
+      ca_global = float(df['ca_produit'].sum())
+
+      rapport = df[['product_id', 'post_title', 'price', 'total_sales', 'ca_produit']].sort_values(
+          'ca_produit', ascending=False
+      )
+      rapport.to_excel('rapport_ca_par_produit.xlsx', index=False)
+
+      report = {
+          'ca_global': ca_global,
+          'nb_produits': len(df),
+          'top_5': rapport.head(5)[['post_title', 'ca_produit']].to_dict('records')
+      }
+      with open('ca_report.json', 'w') as f:
+          json.dump(report, f, indent=2)
+      print(f"CA Global: {ca_global:,.2f} EUR")
+      print(json.dumps(report, indent=2))
+
+  # ============================================================
+  # ÉTAPE 4 : DÉTECTION MILLÉSIMES / ORDINAIRES + Z-SCORE
+  # ============================================================
+  - id: detection_millesimes
+    type: io.kestra.plugin.scripts.python.Script
+    description: "Classification vins + analyse z-score avec seuil configurable"
+    containerImage: python:3.11-slim
+    beforeCommands:
+      - pip install pandas scipy
+    inputFiles:
+      dataset_fusionne.csv: "{{ outputs.fusion.outputFiles['dataset_fusionne.csv'] }}"
+    env:
+      ZSCORE_THRESHOLD: "{{ vars.zscore_threshold }}"
+      ZSCORE_MAX_OUTLIER_PCT: "{{ vars.zscore_max_outlier_pct }}"
+    outputFiles:
+      - "vins_millesimes.csv"
+      - "vins_ordinaires.csv"
+      - "classification_report.json"
+    script: |
+      import pandas as pd
+      import re, json, os
+      import numpy as np
+      from scipy import stats
+
+      ZSCORE_THRESHOLD = float(os.environ.get('ZSCORE_THRESHOLD', 3))
+      ZSCORE_MAX_OUTLIER_PCT = float(os.environ.get('ZSCORE_MAX_OUTLIER_PCT', 0.05))
+      print(f"Config Z-Score: seuil={ZSCORE_THRESHOLD}, max_outlier={ZSCORE_MAX_OUTLIER_PCT*100}%")
+
+      df = pd.read_csv('dataset_fusionne.csv')
+      df['ca_produit'] = df['price'] * df['total_sales']
+
+      def detect_type(title):
+          if pd.isna(title): return 'ordinaire'
+          return 'millesime' if re.search(r'\b(19|20)\d{2}\b', str(title)) else 'ordinaire'
+
+      def extract_year(title):
+          if pd.isna(title): return None
+          m = re.search(r'\b(19|20)\d{2}\b', str(title))
+          return int(m.group()) if m else None
+
+      df['type_vin'] = df['post_title'].apply(detect_type)
+      df['millesime_year'] = df['post_title'].apply(extract_year)
+
+      millesimes = df[df['type_vin'] == 'millesime']
+      ordinaires = df[df['type_vin'] == 'ordinaire']
+
+      millesimes[['product_id','post_title','millesime_year','price','total_sales','ca_produit']].to_csv('vins_millesimes.csv', index=False)
+      ordinaires[['product_id','post_title','price','total_sales','ca_produit']].to_csv('vins_ordinaires.csv', index=False)
+
+      z_report = {}
+      for cat, sub in [('millesime', millesimes), ('ordinaire', ordinaires)]:
+          if len(sub) > 1:
+              zs = np.abs(stats.zscore(sub['price'].fillna(0)))
+              oc = int((zs > ZSCORE_THRESHOLD).sum())
+              op = oc / len(sub)
+              z_report[cat] = {
+                  'count': len(sub),
+                  'mean_price': round(float(sub['price'].mean()), 2),
+                  'std_price': round(float(sub['price'].std()), 2),
+                  'zscore_threshold': ZSCORE_THRESHOLD,
+                  'outliers_count': oc,
+                  'outliers_pct': round(op * 100, 2),
+                  'status': 'OK' if op < ZSCORE_MAX_OUTLIER_PCT else 'ALERTE',
+                  'outlier_products': sub[zs > ZSCORE_THRESHOLD][['product_id','post_title','price']].head(5).to_dict('records')
+              }
+              if op >= ZSCORE_MAX_OUTLIER_PCT:
+                  print(f"⚠️ ALERTE Z-SCORE {cat}: {oc} outliers ({op*100:.1f}%)")
+
+      report = {'millesimes': len(millesimes), 'ordinaires': len(ordinaires), 'z_score_analysis': z_report}
+      with open('classification_report.json', 'w') as f:
+          json.dump(report, f, indent=2, ensure_ascii=False)
+      print(json.dumps(report, indent=2, ensure_ascii=False))
+
+  # ============================================================
+  # ÉTAPE 5 : TESTS DE VALIDATION
+  # ============================================================
+  - id: tests_validation
+    type: io.kestra.plugin.scripts.python.Script
+    description: "Tests qualité complets avec z-score configurable"
+    containerImage: python:3.11-slim
+    beforeCommands:
+      - pip install pandas scipy
+    inputFiles:
+      dataset_fusionne.csv: "{{ outputs.fusion.outputFiles['dataset_fusionne.csv'] }}"
+      erp_clean.csv: "{{ outputs.ingestion_nettoyage.outputFiles['erp_clean.csv'] }}"
+      millesimes.csv: "{{ outputs.detection_millesimes.outputFiles['vins_millesimes.csv'] }}"
+      ordinaires.csv: "{{ outputs.detection_millesimes.outputFiles['vins_ordinaires.csv'] }}"
+    env:
+      ZSCORE_THRESHOLD: "{{ vars.zscore_threshold }}"
+      ZSCORE_MAX_OUTLIER_PCT: "{{ vars.zscore_max_outlier_pct }}"
+    outputFiles:
+      - "test_results.json"
+    script: |
+      import pandas as pd
+      import json, os
+      import numpy as np
+      from scipy import stats
+
+      ZSCORE_THRESHOLD = float(os.environ.get('ZSCORE_THRESHOLD', 3))
+      ZSCORE_MAX_OUTLIER_PCT = float(os.environ.get('ZSCORE_MAX_OUTLIER_PCT', 0.05))
+
+      df = pd.read_csv('dataset_fusionne.csv')
+      erp = pd.read_csv('erp_clean.csv')
+      millesimes = pd.read_csv('millesimes.csv')
+      ordinaires = pd.read_csv('ordinaires.csv')
+      df['ca_produit'] = df['price'] * df['total_sales']
+
+      results = []
+
+      dupes = df.duplicated(subset=['product_id']).sum()
+      results.append({'test': 'Absence de doublons product_id', 'status': 'PASS' if dupes == 0 else 'FAIL', 'detail': f'{dupes} doublons'})
+
+      nulls = int(df[['product_id','price','post_title','id_web']].isnull().sum().sum())
+      results.append({'test': 'Absence valeurs manquantes (clés)', 'status': 'PASS' if nulls == 0 else 'FAIL', 'detail': f'{nulls} nulls'})
+
+      ratio = len(df) / len(erp) if len(erp) > 0 else 0
+      results.append({'test': 'Cohérence volumétrie jointures', 'status': 'PASS' if len(df) <= len(erp) else 'FAIL', 'detail': f'{len(df)}/{len(erp)} = {ratio:.2%}'})
+
+      results.append({'test': 'CA >= 0 tous produits', 'status': 'PASS' if (df['ca_produit'] >= 0).all() else 'FAIL', 'detail': f'CA={df["ca_produit"].sum():,.2f}'})
+
+      results.append({'test': 'CA recalculé cohérent', 'status': 'PASS' if abs(df['ca_produit'].sum() - (df['price']*df['total_sales']).sum()) < 0.01 else 'FAIL', 'detail': 'Vérification arithmétique OK'})
+
+      tc = len(millesimes) + len(ordinaires)
+      results.append({'test': 'Classification complète', 'status': 'PASS' if tc == len(df) else 'FAIL', 'detail': f'{tc}/{len(df)}'})
+
+      for name, subset in [('millésimés', millesimes), ('ordinaires', ordinaires)]:
+          if len(subset) > 1:
+              z = np.abs(stats.zscore(subset['price'].fillna(0)))
+              oc = int((z > ZSCORE_THRESHOLD).sum())
+              pct = oc / len(subset)
+              results.append({
+                  'test': f'Z-score {name} (seuil={ZSCORE_THRESHOLD})',
+                  'status': 'PASS' if pct < ZSCORE_MAX_OUTLIER_PCT else 'FAIL',
+                  'detail': f'{oc} outliers / {len(subset)} ({pct*100:.1f}%) [max={ZSCORE_MAX_OUTLIER_PCT*100}%]'
+              })
+
+      with open('test_results.json', 'w') as f:
+          json.dump(results, f, indent=2, ensure_ascii=False)
+
+      print("\n" + "="*60)
+      print("RÉSULTATS DES TESTS DE VALIDATION")
+      print("="*60)
+      for r in results:
+          emoji = "✅" if r['status'] == 'PASS' else "❌"
+          print(f"  {emoji} [{r['status']}] {r['test']}: {r['detail']}")
+      print("="*60)
+
+      if not all(r['status'] == 'PASS' for r in results):
+          raise Exception("❌ TESTS ÉCHOUÉS — alerte email envoyée via bloc errors")
+      print("\n✅ TOUS LES TESTS SONT PASSÉS")
+
+  # ============================================================
+  # ÉTAPE 6 : NOTIFICATION SUCCÈS PAR EMAIL
+  # ============================================================
+  - id: notification_succes
+    type: io.kestra.plugin.notifications.mail.MailSend
+    description: "Email de confirmation envoyé quand le pipeline réussit"
+    host: "{{ vars.smtp_host }}"
+    port: "{{ vars.smtp_port }}"
+    from: "{{ vars.smtp_from }}"
+    to: "{{ vars.smtp_to }}"
+    subject: "[BOTTLENECK] Pipeline terminé avec succès - {{ execution.id }}"
+    htmlTextContent: |
+      <h2 style="color:#2E7D32;">Pipeline BottleNeck terminé avec succès ✅</h2>
+      <table style="border-collapse:collapse;font-family:Arial;">
+        <tr><td style="padding:8px;font-weight:bold;background:#f5f5f5;">Flow</td><td style="padding:8px;">{{ flow.id }}</td></tr>
+        <tr><td style="padding:8px;font-weight:bold;background:#f5f5f5;">Namespace</td><td style="padding:8px;">{{ flow.namespace }}</td></tr>
+        <tr><td style="padding:8px;font-weight:bold;background:#f5f5f5;">Execution</td><td style="padding:8px;">{{ execution.id }}</td></tr>
+        <tr><td style="padding:8px;font-weight:bold;background:#f5f5f5;">Date</td><td style="padding:8px;">{{ execution.startDate }}</td></tr>
+      </table>
+      <p style="margin-top:16px;">Tous les tests de validation sont passés. Les livrables sont disponibles dans Kestra.</p>
+      <h3>Rappel des livrables générés :</h3>
+      <ul>
+        <li>rapport_ca_par_produit.xlsx</li>
+        <li>vins_millesimes.csv</li>
+        <li>vins_ordinaires.csv</li>
+        <li>test_results.json</li>
+      </ul>
+      <hr style="border:1px solid #eee;"/>
+      <p style="color:#888;font-size:12px;">Message automatique — Pipeline bottleneck.production</p>

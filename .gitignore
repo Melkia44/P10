@@ -1,0 +1,11 @@
+# Données sources 
+Data/
+
+# Documents de présentation 
+Presentation/
+
+# Outputs générés par le pipeline
+Output/
+
+# Workflow généré automatiquement par le script d'installation
+install/workflow_ready.yaml
