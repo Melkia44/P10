@@ -23,7 +23,6 @@ P10/
 │
 └── Presentation/               ← Documents de soutenance
     ├── diagramme_flux_pipeline.drawio  Diagramme du pipeline
-    ├── guide_complet_projet_P10.docx   Documentation technique complète
     └── presentation_soutenance_P10.pptx  11 slides pour la soutenance
 ```
 
