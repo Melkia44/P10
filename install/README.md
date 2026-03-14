@@ -10,7 +10,8 @@ P10/
 │   └── Fichier_web.xlsx            Web : catalogue WooCommerce, ventes
 │
 ├── install/                    ← Scripts d'installation + workflow
-│   ├── install_pipeline.sh         Lance Docker, Kestra, MailHog
+│   ├── docker-compose.yml          Kestra + Postgres + MailHog (réseau explicite)
+│   ├── install_pipeline.sh         Lance tout via docker compose
 │   ├── stop_pipeline.sh            Arrête tout proprement
 │   ├── workflow_bottleneck_smtp.yaml   Workflow Kestra (template)
 │   ├── workflow_ready.yaml         Généré par le script (prêt à coller)
