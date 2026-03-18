@@ -12,7 +12,7 @@ labels:
 variables:
   zscore_threshold: 3
   zscore_max_outlier_pct: 0.05
-  smtp_host: "host.docker.internal"
+  smtp_host: "mailhog"          # ✅ nom de service Docker — stable même après docker compose down -v
   smtp_port: "1025"
   smtp_from: "kestra-pipeline@bottleneck.fr"
   smtp_to: "laurent.manager@bottleneck.fr"
@@ -36,6 +36,7 @@ errors:
     type: io.kestra.plugin.notifications.mail.MailSend
     host: "{{ vars.smtp_host }}"
     port: "{{ vars.smtp_port }}"
+    transportStrategy: SMTP
     from: "{{ vars.smtp_from }}"
     to: "{{ vars.smtp_to }}"
     subject: "[BOTTLENECK] Pipeline en ERREUR - {{ execution.id }}"
@@ -368,6 +369,7 @@ tasks:
     description: "Email de confirmation envoyé quand le pipeline réussit"
     host: "{{ vars.smtp_host }}"
     port: "{{ vars.smtp_port }}"
+    transportStrategy: SMTP
     from: "{{ vars.smtp_from }}"
     to: "{{ vars.smtp_to }}"
     subject: "[BOTTLENECK] Pipeline terminé avec succès - {{ execution.id }}"
