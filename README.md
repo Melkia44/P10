@@ -121,7 +121,7 @@ P10/
 
 ```bash
 # 1. Cloner le dépôt
-git clone git@github.com:Melkia44/P10.git
+git clone git@github.com:Melkia44/Mlops-orchestration-pipeline.git
 cd P10
 
 # 2. Placer les fichiers de données dans Data/
@@ -279,7 +279,7 @@ Ce sont des warnings non bloquants liés au formatage Excel avancé. Le pipeline
 ## 👤 Auteur
 
 **Mathieu** — Étudiant Master 2 Data Engineering, OpenClassrooms  
-Dépôt : [github.com/Melkia44/P10](https://github.com/Melkia44/P10)
+Dépôt : [github.com/Melkia44/Mlops-orchestration-pipeline](https://github.com/Melkia44/Mlops-orchestration-pipeline)
 
 ---
 
