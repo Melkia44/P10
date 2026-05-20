@@ -344,7 +344,7 @@ Ce sont des warnings **non bloquants** liés au formatage Excel avancé. Le pipe
 **Mathieu Lowagie**  
 Data Engineer | Service Delivery Manager — 17 ans d'expérience B2B télécoms
 
-🔗 [LinkedIn](https://www.linkedin.com/in/mathieulowagie/) • 💼 [GitHub](https://github.com/Melkia44)
+🔗 [LinkedIn](https://www.linkedin.com/in/mathieu-pm/) • 💼 [GitHub](https://github.com/Melkia44)
 
 ---
 
